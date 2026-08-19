@@ -1,0 +1,15 @@
+# Binary
+jump-server
+jump-mcp-server
+
+# Audit logs
+audit/*.jsonl
+!audit/.gitkeep
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store

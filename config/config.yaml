@@ -1,0 +1,38 @@
+# SSH 跳板机配置
+ssh:
+  # 多环境跳板机定义（通过 env=test/prod 选择）
+  bastions:
+    test: # 测试环境
+      host: "bastion-test" #   取 ~/.ssh/config 中的 Host 别名
+      user: "ops" #   登录用户
+      mode: "pipe" #   连接方式: pipe（通过 stdin pipe 绕过 sudosh）
+    prod: # 生产环境
+      host: "bastion-prod"
+      user: "deploy"
+      mode: "proxyjump" #   连接方式: proxyjump（依赖 SSH ControlMaster）
+
+  socket_pattern: "~/.ssh/sockets/{user}@{host}:22"
+  skip_socket_check: false
+  default_user: "root"
+  connect_timeout: 10
+  exec_timeout: 60
+
+# SCP 文件上传配置
+scp:
+  default_user: "ops"
+  connect_timeout: 10
+
+# 审计日志
+audit:
+  dir: "audit"
+
+# 状态存储（SQLite）
+store:
+  path: "~/.jump-server/jump.db"
+
+# 限流配置（SQLite 持久化）
+ratelimit:
+  enabled: true
+  global_rate: 60 # 令牌桶填充速率（个/分钟）
+  global_burst: 5 # 令牌桶容量（突发允许的并发数）
+  cmd_cooldown: 5 # 同一命令的冷却时间（秒）
