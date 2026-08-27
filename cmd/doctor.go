@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/bitfrost7/jump-server-cli/config"
@@ -16,7 +17,11 @@ var doctorCmd = &cobra.Command{
 	Short: "检测所有环境连通性（test + prod）",
 	Long: `检测跳板机连通性。
 
-无需参数，自动检测 test 和 prod 两个环境。`,
+无需参数，自动检测 test 和 prod 两个环境。
+
+注意：跳板机服务端仅支持密码认证（公钥认证被关闭），日常免密依赖
+ControlMaster 长连接（` + "`jump-server connect`" + ` 建立，4 小时有效）。
+本命令只检测“免密长连接”是否可用，绝不会弹出密码输入框。`,
 	Args: cobra.NoArgs,
 	RunE: runDoctor,
 }
@@ -25,10 +30,48 @@ func init() {
 	rootCmd.AddCommand(doctorCmd)
 }
 
-type envCheck struct {
-	env     string
-	bastion config.BastionEntry
-	cfg     config.Config
+// envStatus 记录单个环境的连通性检测结果
+type envStatus struct {
+	Env     string
+	Bastion string
+	OK      bool
+	Reason  string
+}
+
+// probeEnv 检测单个环境：socket 是否存在 + 通过 socket 实际探测一次。
+// 全程 BatchMode，不做任何交互式密码输入；未建立长连接时如实报告。
+func probeEnv(cfg config.Config, env string) envStatus {
+	sshExec := service.NewSSHExecutor(cfg.SSH)
+	be := cfg.SSH.BastionForEnv(env)
+
+	if err := sshExec.CheckSocket(env); err != nil {
+		return envStatus{
+			Env: env, Bastion: be.Host, OK: false,
+			Reason: fmt.Sprintf("需要密码认证，尚未建立免密长连接：%v", err),
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	start := time.Now()
+	out, err := sshExec.ExecuteDirect(ctx, be.User, be.Host, "echo ok")
+	dur := time.Since(start)
+	if err != nil {
+		return envStatus{
+			Env: env, Bastion: be.Host, OK: false,
+			Reason: fmt.Sprintf("探测失败（%v）：%v", dur.Round(time.Millisecond), err),
+		}
+	}
+	if strings.TrimSpace(out) != "ok" {
+		return envStatus{
+			Env: env, Bastion: be.Host, OK: false,
+			Reason: fmt.Sprintf("探测结果异常: %q", out),
+		}
+	}
+	return envStatus{
+		Env: env, Bastion: be.Host, OK: true,
+		Reason: fmt.Sprintf("免密长连接复用 %v", dur.Round(time.Millisecond)),
+	}
 }
 
 func runDoctor(cmd *cobra.Command, args []string) error {
@@ -38,24 +81,18 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("❌ 加载配置失败: %w", err)
 	}
 
-	envs := []envCheck{
-		{
-			env:     "test",
-			bastion: cfg.SSH.BastionForEnv("test"),
-			cfg:     cfg,
-		},
-		{
-			env:     "prod",
-			bastion: cfg.SSH.BastionForEnv("prod"),
-			cfg:     cfg,
-		},
-	}
-
 	allOK := true
-
-	for _, ec := range envs {
-		ok := checkEnv(ec)
-		if !ok {
+	for _, env := range []string{"test", "prod"} {
+		st := probeEnv(cfg, env)
+		fmt.Println("═══════════════════════════════════")
+		fmt.Println("🔍", st.Env, "环境")
+		fmt.Println("═══════════════════════════════════")
+		fmt.Print("📡 跳板机 ", st.Bastion, "... ")
+		if st.OK {
+			fmt.Println("✅", st.Reason)
+		} else {
+			fmt.Println("❌")
+			fmt.Printf("   %s\n", st.Reason)
 			allOK = false
 		}
 		fmt.Println()
@@ -63,34 +100,12 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 
 	fmt.Println("═══════════════════════════════════")
 	if allOK {
-		fmt.Println("✅ 全部环境正常")
+		fmt.Println("✅ 全部环境正常（免密长连接已就绪，无需密码）")
 	} else {
-		fmt.Println("⚠️  存在异常，请检查上述错误")
+		fmt.Println("⚠️  存在异常：请先执行 `jump-server connect` 输入一次密码建立免密长连接")
 		os.Exit(1)
 	}
 	return nil
-}
-
-func checkEnv(ec envCheck) bool {
-	sshExec := service.NewSSHExecutor(ec.cfg.SSH)
-	ctx := context.Background()
-
-	fmt.Println("═══════════════════════════════════")
-	fmt.Println("🔍", ec.env, "环境")
-	fmt.Println("═══════════════════════════════════")
-
-	// ── 跳板机连通性 ──
-	fmt.Print("📡 跳板机 ", ec.bastion.Host, "... ")
-	start := time.Now()
-	_, err := sshExec.ExecuteDirect(ctx, ec.bastion.User, ec.bastion.Host, "echo ok")
-	dur := time.Since(start)
-	if err != nil {
-		fmt.Println("❌")
-		fmt.Printf("   %v\n", err)
-		return false
-	}
-	fmt.Println("✅", dur.Round(time.Millisecond))
-	return true
 }
 
 func firstLine(s string) string {

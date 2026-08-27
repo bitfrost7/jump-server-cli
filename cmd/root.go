@@ -132,6 +132,10 @@ func runCmd(ctx context.Context, cfg config.Config, sshExec *service.SSHExecutor
 		})
 		return err
 	}
+	// 跳板机仅支持密码认证，日常免密依赖 ControlMaster 长连接；未建立时直接给出指引
+	if err := sshExec.CheckSocket(envFlag); err != nil {
+		return err
+	}
 	start := time.Now()
 
 	var output string

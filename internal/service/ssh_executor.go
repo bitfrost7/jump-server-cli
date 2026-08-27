@@ -2,10 +2,12 @@ package service
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -54,16 +56,36 @@ func (s *SSHExecutor) ResolveBastionHostname(env string) string {
 	return resolveHostname(s.cfg.BastionForEnv(env).Host)
 }
 
-func (s *SSHExecutor) CheckSocket(env string) error {
+// SocketPath 返回指定环境跳板机的 ControlMaster socket 路径（~ 自动展开）。
+func (s *SSHExecutor) SocketPath(env string) (string, error) {
 	sp := s.cfg.SocketPattern
 	if sp == "" {
-		return nil
+		return "", fmt.Errorf("socket_pattern 未配置")
 	}
 	be := s.cfg.BastionForEnv(env)
 	realHost := resolveHostname(be.Host)
-	socketPath := strings.ReplaceAll(strings.ReplaceAll(sp, "{user}", be.User), "{host}", realHost)
+	p := strings.ReplaceAll(strings.ReplaceAll(sp, "{user}", be.User), "{host}", realHost)
+	if strings.HasPrefix(p, "~/") {
+		home, _ := os.UserHomeDir()
+		p = filepath.Join(home, p[2:])
+	}
+	return p, nil
+}
+
+// CheckSocket 检查免密长连接（ControlMaster socket）是否已建立。
+// 跳板机服务端仅支持密码认证，日常免密依赖该 socket；未建立时返回带指引的错误。
+func (s *SSHExecutor) CheckSocket(env string) error {
+	sp := s.cfg.SocketPattern
+	if sp == "" || s.cfg.SkipSocketCheck {
+		return nil
+	}
+	socketPath, err := s.SocketPath(env)
+	if err != nil {
+		return err
+	}
+	be := s.cfg.BastionForEnv(env)
 	if _, err := os.Stat(socketPath); os.IsNotExist(err) {
-		return fmt.Errorf("SSH ControlMaster socket 不存在: %s\n请先执行 `ssh %s` 建立连接", socketPath, be.Host)
+		return fmt.Errorf("未建立免密长连接（ControlMaster socket 不存在: %s）\n请先执行 `jump-server connect`（或 `ssh %s`）输入一次密码建立连接，4 小时内免密", socketPath, be.Host)
 	}
 	return nil
 }
@@ -94,6 +116,7 @@ func (s *SSHExecutor) ExecuteDirect(ctx context.Context, user, host, cmd string)
 		"-tt",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "BatchMode=yes", // 禁止交互式密码输入：无长连接时快速失败，而不是卡住/弹密码
 		"-o", fmt.Sprintf("ConnectTimeout=%d", s.cfg.ConnectTimeout),
 		fmt.Sprintf("%s@%s", user, host),
 	)
@@ -105,6 +128,10 @@ func (s *SSHExecutor) ExecuteDirect(ctx context.Context, user, host, cmd string)
 
 	out, err := sshCmd.CombinedOutput()
 	cleaned := stripPTY(string(out), marker, cmd)
+	if !bytes.Contains(out, []byte(marker)) {
+		// 标记行未出现在输出中：命令根本没被执行（无长连接、或登录被拒）
+		return cleaned, fmt.Errorf("命令未在 %s 上执行（未建立免密长连接或登录被拒）\n请先执行 `jump-server connect` 建立免密长连接", host)
+	}
 	if err != nil {
 		return cleaned, nil // PTY+sudosh 可能返回非零退出码，但输出有效
 	}
@@ -131,6 +158,7 @@ func (s *SSHExecutor) execPipe(ctx context.Context, user, host, cmd string, be c
 	sshCmd := exec.CommandContext(c, "ssh",
 		"-tt",
 		"-o", "StrictHostKeyChecking=no",
+		"-o", "BatchMode=yes", // 同上：依赖免密长连接，未建立时快速失败
 		"-o", fmt.Sprintf("ConnectTimeout=%s", timeoutStr),
 		be.Host,
 	)
@@ -158,6 +186,7 @@ func (s *SSHExecutor) execProxyJump(ctx context.Context, user, host, cmd string,
 	out, err := exec.CommandContext(c, "ssh",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "BatchMode=yes",
 		"-o", fmt.Sprintf("ConnectTimeout=%d", s.cfg.ConnectTimeout),
 		"-o", fmt.Sprintf("ProxyJump=%s@%s", be.User, be.Host),
 		fmt.Sprintf("%s@%s", user, host), cmd,

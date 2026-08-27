@@ -139,8 +139,19 @@ func handleExec(ctx context.Context, req mcp.CallToolRequest, cfg config.Config,
 		return errResult(err.Error()), nil
 	}
 
-	start := time.Now()
 	sshExec := service.NewSSHExecutor(cfg.SSH)
+	// 跳板机仅支持密码认证，日常免密依赖 ControlMaster 长连接；未建立时直接给出指引
+	if err := sshExec.CheckSocket(env); err != nil {
+		logAudit(cfg, audit.Entry{
+			Tool: "jump_exec", User: targetUserOf(cfg, bastion, host),
+			Host: host, Command: command, Env: env,
+			Allowed: false, Error: err.Error(),
+		})
+		return errResult(err.Error()), nil
+	}
+
+	start := time.Now()
+
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
 	defer cancel()
 
@@ -317,24 +328,20 @@ func handleDoctor(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 	allOK := true
 
 	for _, env := range []string{"test", "prod"} {
-		bastion := cfg.SSH.BastionForEnv(env)
-		sshExec := service.NewSSHExecutor(cfg.SSH)
-
+		st := probeEnv(cfg, env)
 		sb.linef("=== %s ===", env)
-
-		_, err := sshExec.ExecuteDirect(ctx, bastion.User, bastion.Host, "echo ok")
-		if err != nil {
-			sb.linef("  跳板机 %s: ❌ %v", bastion.Host, err)
-			allOK = false
+		if st.OK {
+			sb.linef("  跳板机 %s: ✅ %s", st.Bastion, st.Reason)
 		} else {
-			sb.linef("  跳板机 %s: ✅", bastion.Host)
+			sb.linef("  跳板机 %s: ❌ %s", st.Bastion, st.Reason)
+			allOK = false
 		}
 	}
 
 	if allOK {
-		sb.line("✅ 全部正常")
+		sb.line("✅ 全部正常（免密长连接已就绪，无需密码）")
 	} else {
-		sb.line("⚠️  存在异常")
+		sb.line("⚠️  存在异常：请先执行 `jump-server connect` 输入一次密码建立免密长连接")
 	}
 
 	return textResult(sb.string()), nil
