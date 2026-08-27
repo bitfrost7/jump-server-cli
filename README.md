@@ -105,7 +105,11 @@ jump-server -e test --download /remote/path/file.txt:./local.txt
 ### 连通性检测
 
 ```bash
-# 检测所有环境（test + prod）
+# 建立免密长连接（输入一次密码，4 小时内免密；跳板机仅支持密码认证）
+jump-server connect          # 依次建立 test + prod
+jump-server connect -e prod  # 只建立指定环境
+
+# 检测所有环境连通性（只检测免密长连接，不会弹密码）
 jump-server doctor
 ```
 
