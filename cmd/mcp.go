@@ -65,7 +65,7 @@ func runMCPServer(cmd *cobra.Command, args []string) error {
 文件传输请用 jump_upload / jump_download，不要把文件内容塞进命令行。`),
 		mcp.WithDestructiveHintAnnotation(true),
 		mcp.WithOpenWorldHintAnnotation(true),
-		mcp.WithString("command", mcp.Description("单条 shell 命令。建议不超过 300 字符，不要用 ; 或 && 串联多个不同目的的动作")),
+		mcp.WithString("command", mcp.Description("单条 shell 命令（建议不超过 500 字符）。一条命令只做一件事，不要用 ; 或 && 串联多个不同目的的动作；多条命令请用 commands")),
 		mcp.WithArray("commands",
 			mcp.Description("需要连续执行的多条命令（一次登录、按顺序执行）。需要连续做几件事时优先用这个，而不是把命令拼成长串"),
 			mcp.WithStringItems(),
@@ -83,6 +83,7 @@ func runMCPServer(cmd *cobra.Command, args []string) error {
 		mcp.WithDescription(`上传本地文件到跳板机或远程主机。host 留空则传到跳板机。
 
 这是传文件的唯一正确通道：不要用 echo '<base64>' | base64 -d 之类的方式在命令行里写文件。`),
+		mcp.WithReadOnlyHintAnnotation(false),
 		mcp.WithDestructiveHintAnnotation(true),
 		mcp.WithString("local_path", mcp.Required(), mcp.Description("本地文件路径")),
 		mcp.WithString("remote_path", mcp.Required(), mcp.Description("远程目标路径（建议先落 /tmp）")),
@@ -96,8 +97,9 @@ func runMCPServer(cmd *cobra.Command, args []string) error {
 
 	// ── jump_download ──
 	downloadTool := mcp.NewTool("jump_download",
-		mcp.WithDescription("从跳板机或远程主机下载文件到本地。host 留空则从跳板机下载。"),
+		mcp.WithDescription("从跳板机或远程主机下载文件到本地（只读，不修改远端）。host 留空则从跳板机下载。"),
 		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithString("remote_path", mcp.Required(), mcp.Description("远程文件路径")),
 		mcp.WithString("local_path", mcp.Required(), mcp.Description("本地目标路径")),
 		mcp.WithString("host", mcp.Description("目标主机 IP（留空则从跳板机下载）")),
@@ -110,7 +112,9 @@ func runMCPServer(cmd *cobra.Command, args []string) error {
 
 	// ── jump_doctor ──
 	doctorTool := mcp.NewTool("jump_doctor",
-		mcp.WithDescription("检测所有环境（test + prod）的跳板机连通性。"),
+		mcp.WithDescription("检测所有环境（test + prod）的跳板机连通性。只读探测，不修改任何状态。"),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithNumber("timeout", mcp.Description("超时秒数"), mcp.DefaultNumber(120)),
 	)
 	s.AddTool(doctorTool, handleDoctor)
