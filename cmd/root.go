@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bitfrost7/jump-server-cli/config"
+	"github.com/bitfrost7/jump-server-cli/internal/policy"
 	"github.com/bitfrost7/jump-server-cli/internal/service"
 	"github.com/bitfrost7/jump-server-cli/pkg/audit"
 	"github.com/bitfrost7/jump-server-cli/pkg/store"
@@ -42,13 +43,19 @@ var rootCmd = &cobra.Command{
 	Short: "SSH/SCP 远程执行工具",
 	Long: `通过中转服务器执行 SSH 命令或传输文件。
 
-支持多环境（test/prod）、远程主机中转，无需白名单。`,
+支持多环境（test/prod）、远程主机中转。执行前经安全策略校验：
+黑名单拦截危险命令，生产环境（prod）开启只读。
+
+常用：
+  jump-server policy list     查看生效的安全规则
+  jump-server policy check CMD    预检一条命令（不执行）
+  jump-server policy replay LOGS  用存量审计回放规则`,
 	Example: `  jump-server doctor
   jump-server -e prod -c "systemctl status nginx"
   jump-server -h 10.0.0.5 -c 'docker ps'
   jump-server --upload ./local.txt:/remote/path/file.txt
   jump-server --download /remote/path/file.txt:./local.txt
-  jump-server -e prod -h db01 --upload ./dump.sql:/tmp/dump.sql`,
+  jump-server policy check -e prod 'rm -rf /tmp'`,
 
 	Args: cobra.NoArgs,
 	RunE: runJump,
@@ -105,12 +112,17 @@ func runJump(cmd *cobra.Command, args []string) error {
 	defer st.Close()
 	slog.Debug("状态存储已打开", "path", dbPath)
 
+	eng, err := buildEngine(cfg)
+	if err != nil {
+		return fmt.Errorf("初始化安全策略失败: %w", err)
+	}
+
 	sshExec := service.NewSSHExecutor(cfg.SSH)
 	bastion := cfg.SSH.BastionForEnv(envFlag)
 	ctx := context.Background()
 
 	if cmdFlag != "" {
-		return runCmd(ctx, cfg, sshExec, bastion, st)
+		return runCmd(ctx, cfg, sshExec, bastion, st, eng)
 	}
 
 	if uploadFlag != "" {
@@ -123,7 +135,30 @@ func runJump(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func runCmd(ctx context.Context, cfg config.Config, sshExec *service.SSHExecutor, bastion config.BastionEntry, st *store.Store) error {
+func runCmd(ctx context.Context, cfg config.Config, sshExec *service.SSHExecutor, bastion config.BastionEntry, st *store.Store, eng *policy.Engine) error {
+	// ── 安全策略 ──
+	v := eng.Check(envFlag, cmdFlag)
+	if v.Blocked() && eng.Enforcing() {
+		e := audit.Entry{
+			Tool: "jump_exec", User: targetUserOf(cfg, bastion, hostFlag),
+			Host: hostFlag, Command: cmdFlag, Env: envFlag,
+			Allowed: false, Error: policyError(v).Error(),
+			Normalized: policy.Normalize(cmdFlag),
+		}
+		auditFromVerdict(&e, v, true)
+		audit.Log(cfg.Audit.Dir, e)
+		return policyError(v)
+	}
+	if v.Decision != policy.Allow {
+		e := audit.Entry{
+			Tool: "jump_exec", User: targetUserOf(cfg, bastion, hostFlag),
+			Host: hostFlag, Command: cmdFlag, Env: envFlag,
+			Allowed: true, Normalized: policy.Normalize(cmdFlag),
+		}
+		auditFromVerdict(&e, v, false)
+		audit.Log(cfg.Audit.Dir, e)
+	}
+
 	if err := enforceRateLimit(st, cfg.Ratelimit, envFlag, hostFlag, cmdFlag); err != nil {
 		audit.Log(cfg.Audit.Dir, audit.Entry{
 			Tool: "jump_exec", User: targetUserOf(cfg, bastion, hostFlag),

@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/bitfrost7/jump-server-cli/config"
+	"github.com/bitfrost7/jump-server-cli/internal/policy"
 	"github.com/bitfrost7/jump-server-cli/internal/service"
 	"github.com/bitfrost7/jump-server-cli/pkg/audit"
 	"github.com/bitfrost7/jump-server-cli/pkg/store"
@@ -39,30 +42,52 @@ func runMCPServer(cmd *cobra.Command, args []string) error {
 	}
 	defer st.Close()
 
+	eng, err := buildEngine(cfg)
+	if err != nil {
+		return fmt.Errorf("初始化安全策略失败: %w", err)
+	}
+
 	s := server.NewMCPServer(
 		"jump-server",
-		"1.0.0",
+		"2.0.0",
+		server.WithInstructions(jumpServerInstructions(eng)),
 	)
 
 	// ── jump_exec ──
 	execTool := mcp.NewTool("jump_exec",
-		mcp.WithDescription("通过跳板机在目标主机执行 SSH 命令。无白名单限制，任意命令均可执行。"),
+		mcp.WithDescription(`通过跳板机执行远程命令（查看状态、读日志、查配置、只读查询）。
+
+执行前每条命令都会经过安全策略校验：裸 socket / 扫描 / 破坏性 / 提权 / 逃逸类命令会被拒绝。
+
+粒度要求：一条命令只做一件事，不要用 ";"、"&&" 串联不同目的的动作；
+同质参数可以合并（ls -la /a /b ✅）；需要连续执行多条时用 commands 参数。
+
+文件传输请用 jump_upload / jump_download，不要把文件内容塞进命令行。`),
+		mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithOpenWorldHintAnnotation(true),
+		mcp.WithString("command", mcp.Description("单条 shell 命令。建议不超过 300 字符，不要用 ; 或 && 串联多个不同目的的动作")),
+		mcp.WithArray("commands",
+			mcp.Description("需要连续执行的多条命令（一次登录、按顺序执行）。需要连续做几件事时优先用这个，而不是把命令拼成长串"),
+			mcp.WithStringItems(),
+		),
 		mcp.WithString("host", mcp.Description("目标主机 IP（留空则在跳板机执行）")),
-		mcp.WithString("command", mcp.Required(), mcp.Description("shell 命令")),
-		mcp.WithString("env", mcp.Description("环境: test/prod"), mcp.DefaultString("test")),
+		mcp.WithString("env", mcp.Description("环境: test/prod。prod 为生产环境，禁止一切写操作"), mcp.DefaultString("test")),
 		mcp.WithNumber("timeout", mcp.Description("超时秒数"), mcp.DefaultNumber(60)),
 	)
 	s.AddTool(execTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		return handleExec(ctx, req, cfg, st)
+		return handleExec(ctx, req, cfg, st, eng)
 	})
 
 	// ── jump_upload ──
 	uploadTool := mcp.NewTool("jump_upload",
-		mcp.WithDescription("上传本地文件到跳板机或远程主机。host 留空则传到跳板机。"),
+		mcp.WithDescription(`上传本地文件到跳板机或远程主机。host 留空则传到跳板机。
+
+这是传文件的唯一正确通道：不要用 echo '<base64>' | base64 -d 之类的方式在命令行里写文件。`),
+		mcp.WithDestructiveHintAnnotation(true),
 		mcp.WithString("local_path", mcp.Required(), mcp.Description("本地文件路径")),
-		mcp.WithString("remote_path", mcp.Required(), mcp.Description("远程目标路径")),
+		mcp.WithString("remote_path", mcp.Required(), mcp.Description("远程目标路径（建议先落 /tmp）")),
 		mcp.WithString("host", mcp.Description("目标主机 IP（留空则传到跳板机）")),
-		mcp.WithString("env", mcp.Description("环境: test/prod"), mcp.DefaultString("test")),
+		mcp.WithString("env", mcp.Description("环境: test/prod。prod 为生产环境，写操作受限"), mcp.DefaultString("test")),
 		mcp.WithNumber("timeout", mcp.Description("超时秒数"), mcp.DefaultNumber(120)),
 	)
 	s.AddTool(uploadTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -72,6 +97,7 @@ func runMCPServer(cmd *cobra.Command, args []string) error {
 	// ── jump_download ──
 	downloadTool := mcp.NewTool("jump_download",
 		mcp.WithDescription("从跳板机或远程主机下载文件到本地。host 留空则从跳板机下载。"),
+		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithString("remote_path", mcp.Required(), mcp.Description("远程文件路径")),
 		mcp.WithString("local_path", mcp.Required(), mcp.Description("本地目标路径")),
 		mcp.WithString("host", mcp.Description("目标主机 IP（留空则从跳板机下载）")),
@@ -118,23 +144,173 @@ func logAudit(cfg config.Config, e audit.Entry) {
 	}
 }
 
-func handleExec(ctx context.Context, req mcp.CallToolRequest, cfg config.Config, st *store.Store) (*mcp.CallToolResult, error) {
+// jumpServerInstructions 作为 MCP initialize 的 instructions 下发，会常驻客户端 system prompt。
+// 这是安全规范的主要传递渠道：工具描述只在被调用时可见，instructions 则一直存在。
+func jumpServerInstructions(eng *policy.Engine) string {
+	mode := "audit —— 只记录、不拦截（灰度观察期）"
+	if eng.Enforcing() {
+		mode = "enforce —— 命中即拒绝"
+	}
+	return fmt.Sprintf(`jump-server：通过跳板机执行远程命令、传输文件。每次执行前都会做安全策略校验，命中红线的命令会被拒绝并留痕。
+
+【当前策略模式】%s
+
+一、安全红线（会被拒绝，不要尝试换写法绕过）
+  1. 裸 socket / 反弹 shell：/dev/tcp、/dev/udp、nc -e、ncat -l、socat exec:、bash -i 重定向
+  2. 扫描：nmap / masscan / zmap / hping3；for 循环批量探测多主机或多端口
+  3. 破坏性：rm -rf /、mkfs、dd of=/dev/*、fork bomb、iptables -F、shutdown / reboot
+  4. 下载即执行：curl | sh、wget | bash、eval $(curl …)
+  5. 凭据读取：.ssh/id_*、/etc/shadow、.docker/config.json、.aws/credentials
+  6. 提权与持久化：sudo su、useradd、crontab、写 authorized_keys / .bashrc
+  7. 逃逸：chroot、mount、nsenter、docker run --privileged、/var/run/docker.sock
+
+二、判断连通性
+  用 nc -z -w2 <host> <port>，或 curl -sS -m2 -o /dev/null -w '%%{http_code}' <url>。
+  更好的做法是直接执行真实命令（curl / docker pull / mysql），报错信息比探测结果更有价值。
+  不要用 /dev/tcp 做可达性测试：它与反弹 shell 无法区分，必然触发安全告警。
+
+三、命令粒度（重要）
+  一条命令只做一件事。不要用 ";"、"&&" 串联多个不同目的的动作。
+  需要连续执行多条时，用 commands 参数一次传多行（一次登录、逐条执行），
+  而不是拼成一条长串命令。
+  同质参数可以合并：ls -la /a /b ✅ ；ls /a; ls /b ❌
+
+四、文件传输
+  一律用 jump_upload / jump_download。不要用 echo '<base64>' | base64 -d 写文件，
+  也不要把大文件内容塞进命令行。
+
+五、生产环境
+  env=prod 为生产环境，禁止一切写操作（写文件、重启服务、变更容器、SQL 写入），
+  只允许只读查询。确需变更请走发布流程。
+
+六、节奏
+  先合并查询再调用；拿到结果后读完再决定下一步。避免固定间隔的高频连续调用。`, mode)
+}
+
+// ── 拟人节奏：批间冷却（同一 MCP 进程内生效）──
+
+var (
+	lastExecMu sync.Mutex
+	lastExecAt time.Time
+)
+
+// waitBatchCooldown 两次执行之间至少间隔 cooldown，模拟"人在看结果"。
+// 用等待而非拒绝：拒绝会让调用方立即重试，反而造成更密集的调用。
+func waitBatchCooldown(ctx context.Context, cooldown time.Duration) {
+	if cooldown <= 0 {
+		return
+	}
+	lastExecMu.Lock()
+	wait := time.Until(lastExecAt.Add(cooldown))
+	lastExecMu.Unlock()
+	if wait <= 0 {
+		return
+	}
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-ctx.Done():
+	}
+}
+
+func markExecDone() {
+	lastExecMu.Lock()
+	lastExecAt = time.Now()
+	lastExecMu.Unlock()
+}
+
+// collectCommands 取出待执行命令：command（单条）与 commands（多条）二选一。
+func collectCommands(args map[string]interface{}) ([]string, error) {
+	single := strings.TrimSpace(strArg(args, "command"))
+	multi := strArgList(args, "commands")
+	switch {
+	case single != "" && len(multi) > 0:
+		return nil, fmt.Errorf("command 与 commands 只能给一个：单条用 command，多条用 commands")
+	case single != "":
+		return []string{single}, nil
+	default:
+		return multi, nil
+	}
+}
+
+func strArgList(args map[string]interface{}, key string) []string {
+	v, ok := args[key]
+	if !ok {
+		return nil
+	}
+	arr, ok := v.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, it := range arr {
+		if s, ok := it.(string); ok && strings.TrimSpace(s) != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func handleExec(ctx context.Context, req mcp.CallToolRequest, cfg config.Config, st *store.Store, eng *policy.Engine) (*mcp.CallToolResult, error) {
 	args := getArgs(req)
 	host := strArg(args, "host")
-	command := strArg(args, "command")
 	env := strArg(args, "env", "test")
 	timeout := intArg(args, "timeout", 60)
 
-	if command == "" {
-		return errResult("command 不能为空"), nil
+	cmds, err := collectCommands(args)
+	if err != nil {
+		return errResult(err.Error()), nil
+	}
+	if len(cmds) == 0 {
+		return errResult("command 或 commands 不能为空"), nil
+	}
+	maxBatch := cfg.Policy.Pacing.MaxCommandsPerBatch
+	if maxBatch <= 0 {
+		maxBatch = 10
+	}
+	if len(cmds) > maxBatch {
+		return errResult(fmt.Sprintf("单次最多 %d 条命令（收到 %d 条）。请分批调用；同质查询请合并，例如 ls -la /a /b",
+			maxBatch, len(cmds))), nil
 	}
 
 	bastion := cfg.SSH.BastionForEnv(env)
-	if err := enforceRateLimit(st, cfg.Ratelimit, env, host, command); err != nil {
+	user := targetUserOf(cfg, bastion, host)
+	batchID := fmt.Sprintf("%d", time.Now().UnixNano())
+
+	// ── 安全策略：任一条被拒则整批不执行（避免部分执行留下中间状态）──
+	for i, c := range cmds {
+		v := eng.Check(env, c)
+		if v.Blocked() && eng.Enforcing() {
+			e := audit.Entry{
+				Tool: "jump_exec", User: user, Host: host, Command: c, Env: env,
+				Allowed: false, Error: policyError(v).Error(),
+				Normalized: policy.Normalize(c),
+				BatchID:    batchID, BatchIndex: i + 1,
+			}
+			auditFromVerdict(&e, v, true)
+			logAudit(cfg, e)
+			return errResult(fmt.Sprintf("整批未执行：第 %d/%d 条未通过安全策略\n\n%s",
+				i+1, len(cmds), policyError(v))), nil
+		}
+		if v.Decision != policy.Allow {
+			// audit 模式下的 deny、以及 warn：只记录，不拦
+			e := audit.Entry{
+				Tool: "jump_exec", User: user, Host: host, Command: c, Env: env,
+				Allowed: true, Normalized: policy.Normalize(c),
+				BatchID: batchID, BatchIndex: i + 1,
+			}
+			auditFromVerdict(&e, v, false)
+			logAudit(cfg, e)
+		}
+	}
+
+	// ── 限流（按整批计一次）──
+	rateKey := strings.Join(cmds, "\n")
+	if err := enforceRateLimit(st, cfg.Ratelimit, env, host, rateKey); err != nil {
 		logAudit(cfg, audit.Entry{
-			Tool: "jump_exec", User: targetUserOf(cfg, bastion, host),
-			Host: host, Command: command, Env: env,
-			Allowed: false, Error: err.Error(),
+			Tool: "jump_exec", User: user, Host: host, Command: rateKey, Env: env,
+			Allowed: false, Error: err.Error(), BatchID: batchID,
 		})
 		return errResult(err.Error()), nil
 	}
@@ -143,36 +319,43 @@ func handleExec(ctx context.Context, req mcp.CallToolRequest, cfg config.Config,
 	// 跳板机仅支持密码认证，日常免密依赖 ControlMaster 长连接；未建立时直接给出指引
 	if err := sshExec.CheckSocket(env); err != nil {
 		logAudit(cfg, audit.Entry{
-			Tool: "jump_exec", User: targetUserOf(cfg, bastion, host),
-			Host: host, Command: command, Env: env,
-			Allowed: false, Error: err.Error(),
+			Tool: "jump_exec", User: user, Host: host, Command: rateKey, Env: env,
+			Allowed: false, Error: err.Error(), BatchID: batchID,
 		})
 		return errResult(err.Error()), nil
 	}
 
-	start := time.Now()
+	// 批间冷却（在超时计时之外：这是"人在看结果"的时间，不应算作执行超时）
+	if cfg.Policy.Pacing.Enabled {
+		waitBatchCooldown(ctx, time.Duration(cfg.Policy.Pacing.BatchCooldownMS)*time.Millisecond)
+	}
 
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+	gapMin := time.Duration(cfg.Policy.Pacing.IntraBatchMinMS) * time.Millisecond
+	gapMax := time.Duration(cfg.Policy.Pacing.IntraBatchMaxMS) * time.Millisecond
+	if !cfg.Policy.Pacing.Enabled {
+		gapMin, gapMax = 0, 0
+	}
+
+	start := time.Now()
+	execCtx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
 	defer cancel()
 
-	var output string
-	var execErr error
-	if host != "" {
-		output, execErr = sshExec.Execute(ctx, "", host, command, env)
-	} else {
-		output, execErr = sshExec.ExecuteDirect(ctx, bastion.User, bastion.Host, command)
-	}
+	// host 为空 = 在跳板机执行；非空 = 经跳板机到目标机执行
+	output, execErr := sshExec.ExecuteBatch(execCtx, env, host, "", cmds, gapMin, gapMax)
 	dur := time.Since(start)
+	markExecDone()
 
 	// PTY 模式下退出码不可靠，输出即结果；错误记入审计
 	success := execErr == nil
-	logAudit(cfg, audit.Entry{
-		Tool: "jump_exec", User: targetUserOf(cfg, bastion, host),
-		Host: host, Command: command, Env: env,
-		Allowed: true, Success: &success,
-		Output: truncateOutput(output, 2048), Error: errString(execErr),
-		Duration: dur.String(),
-	})
+	for i, c := range cmds {
+		logAudit(cfg, audit.Entry{
+			Tool: "jump_exec", User: user, Host: host, Command: c, Env: env,
+			Allowed: true, Success: &success,
+			Output: truncateOutput(output, 2048), Error: errString(execErr),
+			Duration: dur.String(),
+			BatchID:  batchID, BatchIndex: i + 1,
+		})
+	}
 	return textResult(output), nil
 }
 

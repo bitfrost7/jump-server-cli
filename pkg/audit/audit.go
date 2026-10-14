@@ -23,6 +23,18 @@ type Entry struct {
 	Output    string `json:"output,omitempty"`
 	Error     string `json:"error,omitempty"`
 	Duration  string `json:"duration,omitempty"`
+
+	// 安全策略判定（决定这条命令是否被拦/为何被拦）
+	Policy     string `json:"policy,omitempty"`     // allow | warn | deny
+	RuleID     string `json:"rule_id,omitempty"`    // 命中的规则 id
+	Severity   string `json:"severity,omitempty"`   // critical | high | medium | low
+	Reason     string `json:"reason,omitempty"`     // 命中原因
+	Enforced   bool   `json:"enforced,omitempty"`   // 是否真的拦下（audit 模式下为 false）
+	Normalized string `json:"normalized,omitempty"` // 归一化后的命令，便于回溯绕过手法
+
+	// 批量执行
+	BatchID    string `json:"batch_id,omitempty"`
+	BatchIndex int    `json:"batch_index,omitempty"`
 }
 
 // Log 追加一条记录到 <dir>/audit-YYYY-MM-DD.jsonl。

@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bitfrost7/jump-server-cli/config"
@@ -105,6 +107,57 @@ func (s *SSHExecutor) Execute(ctx context.Context, user, host, cmd, env string) 
 }
 
 func (s *SSHExecutor) ExecuteDirect(ctx context.Context, user, host, cmd string) (string, error) {
+	return s.execDirectMany(ctx, user, host, []string{cmd}, 0, 0)
+}
+
+// ExecuteBatch 按顺序执行多条命令。
+//
+// host 为空表示在跳板机本身执行（user 为跳板机登录用户），
+// host 非空表示经跳板机到目标主机执行（user 为空时自动解析）。
+//
+// gapMin/gapMax 为命令之间的随机间隔：
+//   - 在跳板机上执行时逐行下发，间隔生效（上游 PTY 会话）；
+//   - 到目标主机执行时用一次 heredoc 连续下发，
+//     多条命令落在同一个 shell 会话里，审计上是连续的 N 行——
+//     这正是人类登录后逐条敲命令的形态。
+//
+// 目的：把「一次调用一条命令、短间隔反复调用」改为「一次调用完成一组查询」，
+// 既降低调用频次，也让跳板机侧的命令历史更像人在操作。
+func (s *SSHExecutor) ExecuteBatch(ctx context.Context, env, host, user string, cmds []string, gapMin, gapMax time.Duration) (string, error) {
+	cmds = trimEmpty(cmds)
+	if len(cmds) == 0 {
+		return "", nil
+	}
+	be := s.cfg.BastionForEnv(env)
+
+	// 目标：跳板机本身
+	if host == "" {
+		if user == "" {
+			user = be.User
+		}
+		if len(cmds) == 1 {
+			gapMin, gapMax = 0, 0 // 单条命令无需批内间隔
+		}
+		return s.execDirectMany(ctx, user, be.Host, cmds, gapMin, gapMax)
+	}
+
+	// 目标：跳板机之后的主机（一次登录，多条命令连续下发）
+	return s.Execute(ctx, user, host, strings.Join(cmds, "\n"), env)
+}
+
+func trimEmpty(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		s = strings.TrimRight(s, "\n")
+		if strings.TrimSpace(s) != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// execDirectMany 在跳板机上执行 1..N 条命令，命令之间按 [gapMin,gapMax] 随机等待。
+func (s *SSHExecutor) execDirectMany(ctx context.Context, user, host string, cmds []string, gapMin, gapMax time.Duration) (string, error) {
 	if user == "" {
 		user = s.cfg.DefaultUser
 	}
@@ -122,20 +175,76 @@ func (s *SSHExecutor) ExecuteDirect(ctx context.Context, user, host, cmd string)
 	)
 	// 用标记行区分 PTY 输出，stripPTY 截取标记后的内容
 	marker := "===JUMPEXEC==="
-	stdin, _ := sshCmd.StdinPipe()
-	stdin.Write([]byte(fmt.Sprintf("echo '%s' && %s; exit\n", marker, cmd)))
+	var buf syncWriter
+	sshCmd.Stdout = &buf
+	sshCmd.Stderr = &buf
+
+	stdin, err := sshCmd.StdinPipe()
+	if err != nil {
+		return "", fmt.Errorf("建立 stdin 管道失败: %w", err)
+	}
+	if err := sshCmd.Start(); err != nil {
+		return "", fmt.Errorf("启动 ssh 失败: %w", err)
+	}
+
+	// 标记行与命令分开下发：标记只用于本地区分 PTY 回显，不污染命令本身。
+	fmt.Fprintf(stdin, "echo '%s'\n", marker)
+	for i, cmd := range cmds {
+		fmt.Fprintf(stdin, "%s\n", cmd)
+		if i < len(cmds)-1 {
+			sleepRand(c, gapMin, gapMax)
+		}
+	}
+	fmt.Fprintln(stdin, "exit")
 	stdin.Close()
 
-	out, err := sshCmd.CombinedOutput()
-	cleaned := stripPTY(string(out), marker, cmd)
-	if !bytes.Contains(out, []byte(marker)) {
+	waitErr := sshCmd.Wait()
+	out := buf.String()
+	cleaned := stripPTY(out, marker, strings.Join(cmds, "\n"))
+	if !strings.Contains(out, marker) {
 		// 标记行未出现在输出中：命令根本没被执行（无长连接、或登录被拒）
 		return cleaned, fmt.Errorf("命令未在 %s 上执行（未建立免密长连接或登录被拒）\n请先执行 `jump-server connect` 建立免密长连接", host)
 	}
-	if err != nil {
-		return cleaned, nil // PTY+sudosh 可能返回非零退出码，但输出有效
-	}
+	_ = waitErr // PTY + sudosh 可能返回非零退出码，但输出有效
 	return cleaned, nil
+}
+
+// syncWriter 串行化 stdout/stderr 的写入，避免 os/exec 的两个拷贝 goroutine 竞争。
+type syncWriter struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (w *syncWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.Write(p)
+}
+
+func (w *syncWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.String()
+}
+
+// sleepRand 等待 [min,max) 内的随机时长；ctx 取消时立即返回。
+func sleepRand(ctx context.Context, min, max time.Duration) {
+	if max <= 0 {
+		return
+	}
+	d := min
+	if max > min {
+		d = min + time.Duration(rand.Int63n(int64(max-min)))
+	}
+	if d <= 0 {
+		return
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-ctx.Done():
+	}
 }
 
 func (s *SSHExecutor) execPipe(ctx context.Context, user, host, cmd string, be config.BastionEntry) (string, error) {

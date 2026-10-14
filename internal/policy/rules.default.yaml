@@ -1,0 +1,374 @@
+# jump-server 默认安全策略
+#
+# ── 匹配说明 ──────────────────────────────────────────────────────
+# 匹配对象是 Normalize(command) 归一化后的文本，正则大小写不敏感。
+#
+# 命令名类规则的 pattern 统一以 (^|[|;&]{1,2}\s*) 开头，表示「必须出现在
+# 命令位置」（行首，或 ; && || | 之后）。这样 `echo "=== mount ==="`
+# 或 `grep mount /etc/fstab` 不会误报，而 `ls && mount /dev/sda` 会被拦。
+#
+# 管道模式类规则（/dev/tcp、curl|sh、rm -rf / 等）保持全文匹配。
+#
+# 解释器内联代码（bash -c '...'）由引擎递归展开后再匹配，无法用普通正则绕过。
+#
+# ── 规则来源 ──────────────────────────────────────────────────────
+# 存量审计（2892 条命令、36 个 jsonl）用途反推 + 已知危险/越狱手法。
+# 存量用途全部落在只读查询与已登记运维脚本内，未出现下述危险动作。
+#
+# 用户覆盖：~/.local/jump-server/policy.yaml（同 id 覆盖，新 id 追加）。
+version: 1
+
+# ── 命令整形阈值 ────────────────────────────────────────────────
+limits:
+  max_command_length: 4000    # 超过直接拒绝（人类手敲不可能这么长）
+  warn_command_length: 300    # 超过提示改用 upload / 拆批
+  warn_chain_segments: 3      # 串联段数 ≥3 提示
+  deny_chain_segments: 6      # 串联段数 ≥6 拒绝（存量 39% 命中，正是要消除的「大片命令」）
+  inline_base64_min: 200      # 命令行内嵌 base64 超过此长度视为自动化上传
+
+# ── 生产环境只读 ────────────────────────────────────────────────
+# true = prod 禁止一切写操作（文件写、服务重启、容器变更、SQL 写入）
+prod_readonly: true
+
+# ══ 黑名单：命中即拒绝 ═════════════════════════════════════════
+deny:
+  # ── 1. 裸 socket / 反弹 shell ──────────────────────────────
+  - id: DENY-101-dev-tcp
+    severity: critical
+    reason: "裸 socket（/dev/tcp|/dev/udp）—— 反弹 shell 的标准写法，流量上与攻击无法区分"
+    advice: "判断连通性请用 `nc -z -w2 <host> <port>` 或 `curl -sS -m2 -o /dev/null -w '%{http_code}' <url>`；或直接执行真实命令看报错"
+    pattern: '/dev/(tcp|udp)'
+
+  - id: DENY-102-nc-exec
+    severity: critical
+    reason: "nc/ncat 带 -e/-c 执行命令（反弹 shell）"
+    advice: "禁止；传文件请用 jump_upload / jump_download"
+    pattern: '(^|[|;&]{1,2}\s*)(nc|ncat|netcat)\b[^|;&]*\s-[a-zA-Z]*[ec][a-zA-Z]*\s'
+
+  - id: DENY-103-socat-exec
+    severity: critical
+    reason: "socat 执行外部程序（反弹 shell）"
+    advice: "禁止"
+    pattern: '(^|[|;&]{1,2}\s*)socat\b[^|;&]*(exec:|system:)'
+
+  - id: DENY-104-bash-interactive
+    severity: critical
+    reason: "交互式 shell（反弹 shell 经典写法）"
+    advice: "禁止"
+    pattern: '(^|[|;&]{1,2}\s*)(bash|sh|zsh|ksh|dash)\b\s+-i\b'
+
+  - id: DENY-105-mkfifo
+    severity: high
+    reason: "mkfifo 几乎只用于配合 nc 构造反弹 shell"
+    advice: "禁止；如确需命名管道请说明用途并走审批"
+    pattern: '(^|[|;&]{1,2}\s*)mkfifo\b'
+
+  - id: DENY-106-nc-listen
+    severity: high
+    reason: "nc 监听端口（后门/反弹 shell 特征）"
+    advice: "禁止"
+    pattern: '(^|[|;&]{1,2}\s*)(nc|ncat)\b[^|;&]*\s-[a-zA-Z]*l[a-zA-Z]*\s'
+
+  # ── 2. 扫描 ────────────────────────────────────────────────
+  - id: DENY-201-scanner
+    severity: critical
+    reason: "端口/网络扫描工具"
+    advice: "禁止；连通性判断用 `nc -z -w2 <host> <port>`"
+    pattern: '(^|[|;&]{1,2}\s*)(nmap|masscan|zmap|hping3|unicornscan|xprobe|arp-scan|fping)\b'
+
+  - id: DENY-202-probe-loop
+    severity: critical
+    reason: "循环批量探测目标（多 IP / 多端口扫描特征）"
+    advice: "禁止未报备的批量探测；如确需检查多个服务，逐条执行并说明用途"
+    pattern: '(^|[|;&]{1,2}\s*)for\s+\w+\s+in\s+[^;]*[^|;&]*(/dev/tcp|/dev/udp|\bnc\b|\bncat\b|\bping\b|\bcurl\b)'
+
+  # ── 3. 破坏性操作 ──────────────────────────────────────────
+  - id: DENY-301-rm-root
+    severity: critical
+    reason: "递归删除根目录"
+    advice: "禁止；删除前请确认精确路径并备份"
+    pattern: '(^|[|;&]{1,2}\s*)rm\s+(-[a-zA-Z]+\s+)*-[a-zA-Z]*[rf][a-zA-Z]*\s+(-\S+\s+)*/(\s|$|\*)'
+
+  - id: DENY-302-no-preserve-root
+    severity: critical
+    reason: "--no-preserve-root 是删除根目录的配套参数"
+    advice: "禁止"
+    pattern: '--no-preserve-root'
+
+  - id: DENY-303-mkfs
+    severity: critical
+    reason: "格式化文件系统"
+    advice: "禁止；磁盘操作走变更流程"
+    pattern: '(^|[|;&]{1,2}\s*)mkfs(\.\w+)?\b'
+
+  - id: DENY-304-dd-blockdev
+    severity: critical
+    reason: "dd 直写块设备"
+    advice: "禁止"
+    pattern: '(^|[|;&]{1,2}\s*)dd\b[^|;&]*\bof=/dev/(sd|vd|nvme|hd|mmcblk|disk|ram)'
+
+  - id: DENY-305-redirect-blockdev
+    severity: critical
+    reason: "重定向直写块设备"
+    advice: "禁止"
+    pattern: '>\s*/dev/(sd|vd|nvme|hd|mmcblk|disk|ram)'
+
+  - id: DENY-306-wipe
+    severity: critical
+    reason: "擦除工具（数据不可恢复）"
+    advice: "禁止"
+    pattern: '(^|[|;&]{1,2}\s*)(shred|wipefs|blkdiscard)\b'
+
+  - id: DENY-307-fork-bomb
+    severity: critical
+    reason: "fork bomb"
+    advice: "禁止"
+    pattern: ':\(\)\s*\{[^}]*\|[^}]*&[^}]*\}'
+
+  - id: DENY-308-chmod-root
+    severity: critical
+    reason: "对根目录递归改属主/权限"
+    advice: "禁止"
+    pattern: '(^|[|;&]{1,2}\s*)ch(mod|own|grp)\s+(-[a-zA-Z]+\s+)*[0-9a-zA-Z:]+(\s+-[a-zA-Z]+)*\s+/(\s|$)'
+
+  - id: DENY-309-iptables-flush
+    severity: critical
+    reason: "清空防火墙规则（切断安全防护）"
+    advice: "禁止；网络策略变更走变更流程"
+    pattern: '(^|[|;&]{1,2}\s*)(iptables|ip6tables|nft)\s+(-[A-Z]+\s+)*(-F|flush)'
+
+  - id: DENY-310-power
+    severity: critical
+    reason: "关机/重启（可能导致业务中断）"
+    advice: "禁止；停机走变更流程"
+    pattern: '(^|[|;&]{1,2}\s*)(shutdown|poweroff|halt|reboot)\b'
+
+  - id: DENY-311-kill-init
+    severity: critical
+    reason: "结束 1 号进程（init/systemd）"
+    advice: "禁止"
+    pattern: '(^|[|;&]{1,2}\s*)kill\s+(-9\s+|-KILL\s+)?1\s*$'
+
+  # ── 4. 供应链 / 下载即执行 ─────────────────────────────────
+  - id: DENY-401-curl-pipe-shell
+    severity: critical
+    reason: "远程脚本直接管道给 shell 执行"
+    advice: "禁止；如需脚本，请先 jump_upload 到 /tmp 并检查内容后再执行"
+    pattern: '(curl|wget)\b[^|;&]*\|[^|;&]*\b(bash|sh|zsh|ksh|dash|fish)\b'
+
+  # curl … | python3 -c "本地代码" 不算（代码来自命令行而非下载内容）；
+  # 但解释器后面没有参数（直接吃 stdin）就是在执行远程代码。
+  - id: DENY-401b-curl-pipe-interpreter
+    severity: critical
+    reason: "远程内容直接交给解释器执行（无本地代码参数）"
+    advice: "禁止；请先下载到 /tmp、审阅后再执行"
+    pattern: '(curl|wget)\b[^|;&]*\|\s*(python3?|perl|ruby|node|php)\s*($|[|;&])'
+
+  - id: DENY-402-eval-download
+    severity: critical
+    reason: "eval 执行下载内容"
+    advice: "禁止"
+    pattern: '(^|[|;&]{1,2}\s*)eval\b[^|;&]*\$\(\s*(curl|wget)'
+
+  - id: DENY-403-source-process-sub
+    severity: high
+    reason: "source 执行网络内容"
+    advice: "禁止"
+    pattern: '(^|[|;&]{1,2}\s*)(source|\.)\s+<\(\s*(curl|wget)'
+
+  # ── 5. 凭据读取 ────────────────────────────────────────────
+  - id: DENY-501-ssh-private-key
+    severity: critical
+    reason: "读取 SSH 私钥/授权文件（凭据窃取特征）"
+    advice: "禁止读取凭据文件；如确需排障请说明用途"
+    pattern: '(^|[|;&]{1,2}\s*)(cat|less|more|head|tail|strings|xxd|od|base64)\b[^|;&]*(\.ssh/id_|\.ssh/authorized_keys)'
+
+  - id: DENY-502-shadow
+    severity: critical
+    reason: "读取 /etc/shadow（口令哈希）"
+    advice: "禁止"
+    pattern: '(^|[|;&]{1,2}\s*)(cat|less|more|head|tail|strings|xxd|od|base64)\b[^|;&]*/etc/shadow'
+
+  - id: DENY-503-docker-cred
+    severity: high
+    reason: "读取容器仓库凭据"
+    advice: "禁止读取凭据文件"
+    pattern: '(^|[|;&]{1,2}\s*)(cat|less|more|head|tail|strings|base64)\b[^|;&]*(\.docker/config\.json|/root/\.docker)'
+
+  - id: DENY-504-cloud-cred
+    severity: high
+    reason: "读取云/集群/数据库凭据文件"
+    advice: "禁止读取凭据文件"
+    pattern: '(^|[|;&]{1,2}\s*)(cat|less|more|head|tail)\b[^|;&]*(\.aws/credentials|\.kube/config|\.netrc|\.pgpass|\.git-credentials|\.my\.cnf)'
+
+  - id: DENY-505-env-secrets
+    severity: high
+    reason: "枚举环境变量中的口令/密钥"
+    advice: "禁止；如需确认配置请读取具体配置文件"
+    pattern: '(^|[|;&]{1,2}\s*)(printenv|env|set)\s*\|[^|;&]*\b(grep|awk|egrep)\b[^|;&]*(pass|secret|token|_key|cred|apikey)'
+
+  - id: DENY-506-history-exfil
+    severity: medium
+    reason: "批量读取 shell 历史（信息收集特征）"
+    advice: "如只为查找自己执行过的命令，请直接说明用途"
+    pattern: '(^|[|;&]{1,2}\s*)(cat|less|more|head|tail|base64|strings)\b[^|;&]*(\.bash_history|\.zsh_history)'
+
+  # ── 6. 提权 / 持久化 ───────────────────────────────────────
+  - id: DENY-601-privilege-escalation
+    severity: critical
+    reason: "提权/切换特权账户"
+    advice: "禁止；需要更高权限请走工单"
+    pattern: '(^|[|;&]{1,2}\s*)(sudo\s+su|sudo\s+-i|sudo\s+-s|sudo\s+-n|su\s+-|su\s+root|visudo|passwd)\b'
+
+  - id: DENY-602-user-management
+    severity: critical
+    reason: "账户增删改（横向移动/留后门特征）"
+    advice: "禁止；账户变更走变更流程"
+    pattern: '(^|[|;&]{1,2}\s*)(useradd|usermod|userdel|groupadd|groupdel|gpasswd|chpasswd)\b'
+
+  - id: DENY-603-shell-rc-write
+    severity: critical
+    reason: "写入 shell 启动文件（持久化后门）"
+    advice: "禁止修改启动脚本"
+    pattern: '(>>?|\|\s*tee)\s*[^\s|;&]*(\.bashrc|\.bash_profile|\.bash_login|\.profile|\.zshrc|/etc/profile|/etc/bashrc)'
+
+  - id: DENY-604-crontab
+    severity: critical
+    reason: "计划任务变更（持久化后门）"
+    advice: "禁止；定时任务走变更流程"
+    pattern: '(^|[|;&]{1,2}\s*)crontab\b'
+
+  - id: DENY-605-authorized-keys-write
+    severity: critical
+    reason: "写入授权公钥（持久化后门）"
+    advice: "禁止"
+    pattern: '(>>?|\|\s*tee)\s*[^\s|;&]*authorized_keys'
+
+  - id: DENY-606-keygen
+    severity: high
+    reason: "生成密钥对（常见于横向移动准备）"
+    advice: "禁止；如确需请说明用途"
+    pattern: '(^|[|;&]{1,2}\s*)ssh-keygen\b'
+
+  - id: DENY-607-selinux-off
+    severity: critical
+    reason: "关闭 SELinux"
+    advice: "禁止"
+    pattern: '(^|[|;&]{1,2}\s*)setenforce\s+0|SELINUX=disabled'
+
+  - id: DENY-608-chattr-immutable
+    severity: high
+    reason: "给文件加不可变属性（反删除/隐藏后门）"
+    advice: "禁止"
+    pattern: '(^|[|;&]{1,2}\s*)chattr\s+[+-][a-zA-Z]*i'
+
+  # ── 7. 逃逸 / 内核 ─────────────────────────────────────────
+  - id: DENY-701-chroot
+    severity: critical
+    reason: "chroot 逃逸"
+    advice: "禁止"
+    pattern: '(^|[|;&]{1,2}\s*)chroot\b'
+
+  - id: DENY-702-mount
+    severity: critical
+    reason: "挂载/卸载文件系统（容器逃逸）"
+    advice: "禁止；如需挂载请走变更流程"
+    pattern: '(^|[|;&]{1,2}\s*)(mount|umount)\b'
+
+  - id: DENY-703-kernel-module
+    severity: critical
+    reason: "内核模块操作（提权/rootkit）"
+    advice: "禁止"
+    pattern: '(^|[|;&]{1,2}\s*)(insmod|rmmod|modprobe|depmod)\b'
+
+  - id: DENY-704-proc-root
+    severity: critical
+    reason: "经 /proc/<pid>/root 访问宿主根文件系统（容器逃逸）"
+    advice: "禁止"
+    pattern: '/proc/\d+/root'
+
+  - id: DENY-705-nsenter
+    severity: critical
+    reason: "进入其他命名空间（容器逃逸）"
+    advice: "禁止"
+    pattern: '(^|[|;&]{1,2}\s*)nsenter\b'
+
+  - id: DENY-706-docker-privileged
+    severity: critical
+    reason: "以特权/宿主命名空间启动容器（容器逃逸）"
+    advice: "禁止；如需起容器请走发布流程"
+    pattern: '(^|[|;&]{1,2}\s*)docker\s+run\b[^|;&]*(--privileged|--pid\s*=\s*host|--net\s*=\s*host|--cap-add|/var/run/docker\.sock)'
+
+  - id: DENY-707-release-agent
+    severity: critical
+    reason: "cgroup release_agent 逃逸"
+    advice: "禁止"
+    pattern: 'release_agent'
+
+  - id: DENY-708-docker-sock
+    severity: critical
+    reason: "直接操作 docker socket（等同宿主 root）"
+    advice: "禁止；请使用 docker CLI"
+    pattern: '/var/run/docker\.sock'
+
+# ══ 提示级：放行但审计标记 risk ════════════════════════════════
+warn:
+  - id: WARN-801-inline-base64
+    severity: medium
+    reason: "命令行内嵌大块 base64（自动化上传特征，非人类手敲）"
+    advice: "请改用 jump_upload 上传文件、jump_download 下载文件"
+    pattern: '(echo|printf)\s+[A-Za-z0-9+/=]{200,}\s*\|'
+
+  - id: WARN-802-inline-script
+    severity: medium
+    reason: "内联解释器脚本（建议落文件后再执行，便于审计）"
+    advice: "请把脚本经 jump_upload 传到 /tmp 后执行"
+    pattern: '(^|[|;&]{1,2}\s*)(python3?|perl|ruby|node|php)\s+-[ce]\s'
+
+  - id: WARN-803-network-fetch
+    severity: medium
+    reason: "从网络下载内容"
+    advice: "确认来源可信；禁止直接管道给 shell"
+    pattern: '(^|[|;&]{1,2}\s*)(curl|wget)\b'
+
+  - id: WARN-804-git-clone
+    severity: low
+    reason: "克隆代码仓库（网络外联）"
+    advice: "确认目标仓库可信"
+    pattern: '(^|[|;&]{1,2}\s*)git\s+(clone|fetch|pull)\b'
+
+  - id: WARN-805-file-transfer-cmd
+    severity: medium
+    reason: "使用 scp/sftp/rsync 直接传文件（绕过 jump_upload 审计）"
+    advice: "请改用 jump_upload / jump_download，大文件尤其"
+    pattern: '(^|[|;&]{1,2}\s*)(scp|sftp|rsync)\b'
+
+  - id: WARN-806-history-read
+    severity: low
+    reason: "读取 shell 历史"
+    advice: "仅用于查找自己执行过的命令"
+    pattern: '(^|[|;&]{1,2}\s*)(history\b|\$HISTFILE)'
+
+  - id: WARN-807-recursive-find
+    severity: low
+    reason: "大范围 find（磁盘 IO 压力）"
+    advice: "请限定目录范围；优先用已有工具（如 noop）"
+    pattern: '(^|[|;&]{1,2}\s*)find\s+/(\s|$)'
+
+# ══ 生产环境专属：prod 下额外禁止（可选正则补充）═════════════
+# 说明：prod 只读的主判定在代码里实现（按「命令首词」精确匹配，避免
+# `ps aux | grep tar` 这类参数误伤）。此段仅在需要追加自定义正则时使用。
+#
+# 代码层在 prod 下已禁止（取 segment 首词，含路径 basename）：
+#   文件写   rm mv cp dd truncate shred install ln touch mkdir rmdir
+#            chmod chown chgrp chattr tee zip tar gzip unzip vi vim nano
+#   服务     docker{restart,stop,start,kill,rm,rmi,create,run,exec,cp,commit,update}
+#            systemctl{restart,stop,start,enable,disable,mask} service{X,restart…}
+#   进程     kill pkill killall
+#   包管理   yum apt apt-get dnf rpm pip npm gem {install,remove,…}
+#   脚本     bash sh zsh python python3 perl ruby node（无法审计脚本内部行为）
+#   其它     iptables mount umount useradd crontab reboot shutdown sysctl
+#   重定向   > 或 >> 指向非 /dev/null 的目标
+#   SQL      easysql/mysql 上下文中的 insert/update/delete/drop/alter/truncate/create/grant
+#   Redis    redis-cli 上下文中的 SET/DEL/FLUSHALL/LPUSH/HSET/ZADD…
+prod_deny: []

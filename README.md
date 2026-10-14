@@ -5,7 +5,8 @@
 ## 特性
 
 - **双环境支持** — 测试 (`jump-test`) / 正式 (`jump1`) 自动切换
-- **无白名单** — 任意命令直接执行，无需审批
+- **安全策略** — 黑名单拦截（裸 socket / 扫描 / 破坏性 / 提权 / 逃逸）、生产环境只读、防绕过规范化，支持 audit 灰度
+- **命令节奏控制** — 批量执行 + 随机间隔，让调用形态贴近人类操作
 - **受限 shell 兼容** — 命令在 lshell/sudosh 内执行且受其检查（禁 ssh、sudo 白名单等照常生效），`-tt + heredoc` 仅适配交互式登录限制
 - **MCP stdio** — 可接入 Hermes 等 MCP 客户端
 - **文件传输** — 上传下载，通过 base64 管道避免 SCP 被拦截
@@ -70,6 +71,12 @@ ratelimit:
 | `ratelimit.global_rate` | 全局令牌桶填充速率（个/分钟） |
 | `ratelimit.global_burst` | 令牌桶容量（突发允许的请求数） |
 | `ratelimit.cmd_cooldown` | 同一命令的冷却时间（秒） |
+| `policy.mode` | `audit`（只记录不拦，灰度用）/ `enforce`（命中即拦） |
+| `policy.rules_file` | 用户覆盖规则文件（不存在则用内嵌默认规则） |
+| `policy.pacing.enabled` | 是否启用命令节奏控制（批内间隔 + 批间冷却） |
+| `policy.pacing.max_commands_per_batch` | 单次批量执行上限（默认 10） |
+| `policy.pacing.intra_batch_min_ms` / `_max_ms` | 批内命令之间的随机间隔（模拟敲键） |
+| `policy.pacing.batch_cooldown_ms` | 两次执行之间的冷却（模拟看结果） |
 
 ## 使用
 
@@ -159,13 +166,69 @@ mcp_servers:
 
 | MCP 工具 | 功能 |
 |----------|------|
-| `jump_exec` | SSH 执行命令 |
+| `jump_exec` | SSH 执行命令（`command` 单条 / `commands` 多条） |
 | `jump_upload` | 上传文件 |
 | `jump_download` | 下载文件 |
 | `jump_doctor` | 连通性检测 |
 
+工具描述中带 `destructiveHint` / `readOnlyHint` 注解，MCP 客户端可据此决定是否需要二次确认。server 启动时通过 `instructions` 下发安全规范（会进入客户端 system prompt）。
+
 > MCP server 自身暴露 `jump_exec` / `jump_upload` / `jump_download` / `jump_doctor`；
 > 接入 Hermes 后工具名会带前缀（如 `mcp_jump_server_jump_exec`）。
+
+## 安全策略
+
+每次执行前对命令做准入判定，命中红线的命令会被拒绝并写入审计（`policy`/`rule_id`/`severity`/`enforced` 字段）。
+
+### 拦截类别
+
+| 类别 | 内容 |
+|------|------|
+| 裸 socket / 反弹 shell | `/dev/tcp`、`/dev/udp`、`nc -e`、`ncat -l`、`socat exec:`、`bash -i`、`mkfifo` |
+| 扫描 | `nmap` / `masscan` / `zmap` / `hping3`，以及 `for` 循环批量探测 |
+| 破坏性 | `rm -rf /`、`mkfs`、`dd of=/dev/*`、fork bomb、`iptables -F`、`shutdown` / `reboot` |
+| 下载即执行 | `curl … \| sh`、`wget … \| bash`、`eval $(curl …)` |
+| 凭据读取 | `.ssh/id_*`、`/etc/shadow`、`.docker/config.json`、`.aws/credentials` |
+| 提权 / 持久化 | `sudo su`、`useradd`、`crontab`、写 `authorized_keys` / `.bashrc` |
+| 逃逸 | `chroot`、`mount`、`nsenter`、`docker run --privileged`、`/var/run/docker.sock` |
+
+命令名类规则锚定在「命令位置」（行首或 `; && \|\| \|` 之后），所以 `echo "=== mount ==="`、`grep mount /etc/fstab` 不会误报，而 `ls && mount /dev/sda /mnt` 会被拦。
+
+### 命令整形
+
+| 约束 | 提示 | 拒绝 |
+|------|------|------|
+| 单条命令长度 | > 300 字符 | > 4000 字符 |
+| 串联段数（`;` `&&` `\|\|` `\|`） | ≥ 3 段 | ≥ 6 段 |
+| 命令行内嵌 base64 | — | prod 下 > 200 字符 |
+
+### 生产环境只读
+
+`env=prod` 且 `prod_readonly: true` 时禁止一切写操作：文件写（`rm`/`mv`/`cp`/`chmod`/`touch`/`tee`/`tar`…）、服务与容器变更（`docker restart`/`systemctl restart`…）、进程操作（`kill`/`pkill`）、软件包管理、脚本执行（`bash`/`python3`，无法审计其内部行为）、SQL 写入（`insert`/`update`/`delete`/`drop`/`alter`…）、Redis 写入、文件重定向、`sudo` 提权。
+
+只读查询照常放行：`ps`、`ls`、`cat`、`grep`、`docker ps` / `logs`、`systemctl status`、SQL `select`、`SHOW CREATE/INDEX/…`。
+
+### 防绕过
+
+匹配前先做规范化：`/dev//tcp`、`/dev/${IFS}tcp`、`$'\x2f'dev/tcp`、`n''map` 都归一到标准形式；解释器内联代码（`bash -c '…'`）会展开后递归检查。
+
+### 灰度与自检
+
+```bash
+jump-server policy list                       # 查看生效规则与阈值
+jump-server policy check -e prod 'rm -rf /'   # 预检一条命令（不执行）
+jump-server policy replay audit/*.jsonl       # 用存量审计回放，评估误报率
+```
+
+上线先用 `mode: audit` 观察误报，确认后改 `enforce`。用户可在 `~/.local/jump-server/policy.yaml` 里按 `id` 覆盖默认规则。
+
+### 命令节奏
+
+为避免「高频、大片、机器般规律」的调用痕迹：
+
+- 需要连续执行多条时用 `commands` 参数（一次登录、逐条执行），而不是把命令拼成长串
+- 批内命令之间插入 0.8~2.5s 随机间隔（模拟敲键）
+- 两次执行之间冷却 3s（模拟看结果）
 
 ## 原理解析
 
@@ -200,12 +263,19 @@ sudosh / lshell 只接受交互式登录（`ssh host cmd` 非交互执行会被�
 │   ├── main.go        # 入口
 │   ├── root.go        # CLI 命令处理 + 文件传输 + 限流
 │   ├── doctor.go      # 连通性检测
-│   └── mcp.go         # MCP stdio 服务器
+│   ├── policy.go      # policy 子命令（list / check / replay）
+│   ├── policy_guard.go # 策略接入（CLI 与 MCP 共用）
+│   └── mcp.go         # MCP stdio 服务器（含安全规范 instructions）
 ├── config/
 │   └── config.go      # 配置加载
 ├── internal/
+│   ├── policy/
+│   │   ├── policy.go            # 策略引擎（判定 / 生产只读 / 内联代码展开）
+│   │   ├── normalize.go         # 命令规范化（防绕过）+ 段数/重定向解析
+│   │   ├── rules.default.yaml   # 内嵌默认规则（go:embed）
+│   │   └── policy_test.go       # 规则回归测试
 │   └── service/
-│       ├── ssh_executor.go   # SSH 执行器（含 PTY 输出清洗）
+│       ├── ssh_executor.go   # SSH 执行器（批量执行 / 拟人节奏 / PTY 输出清洗）
 │       └── scp_executor.go   # SCP 传输器
 ├── pkg/
 │   ├── audit/
