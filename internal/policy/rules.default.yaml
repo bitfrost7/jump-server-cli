@@ -21,7 +21,7 @@ version: 1
 # ── 命令整形阈值 ────────────────────────────────────────────────
 limits:
   max_command_length: 4000    # 超过直接拒绝（人类手敲不可能这么长）
-  warn_command_length: 300    # 超过提示改用 upload / 拆批
+  warn_command_length: 500    # 超过提示；SQL/配置类人类也会粘贴，不宜过紧
   warn_chain_segments: 3      # 串联段数 ≥3 提示
   deny_chain_segments: 6      # 串联段数 ≥6 拒绝（存量 39% 命中，正是要消除的「大片命令」）
   inline_base64_min: 200      # 命令行内嵌 base64 超过此长度视为自动化上传
@@ -354,6 +354,14 @@ warn:
     reason: "大范围 find（磁盘 IO 压力）"
     advice: "请限定目录范围；优先用已有工具（如 noop）"
     pattern: '(^|[|;&]{1,2}\s*)find\s+/(\s|$)'
+
+  # 命令行里的明文凭据会原样落入审计日志与 shell 历史，属于审计合规问题。
+  # 不拦截，但必须提示改用 stdin / 凭据文件。
+  - id: WARN-808-plaintext-credential
+    severity: high
+    reason: "命令行里带明文口令/凭据，会完整落入审计日志与 shell 历史"
+    advice: "改用 stdin 传凭据：`echo $TOKEN | docker login -u <user> --password-stdin`；redis 用配置文件或 AUTH 环境变量"
+    pattern: '(^|[|;&]{1,2}\s*)docker\s+login\b[^|;&]*\s(-p|--password)[ =]\S|(^|[|;&]{1,2}\s*)redis-cli\b[^|;&]*\s-a\s+\S|(^|[|;&]{1,2}\s*)curl\b[^|;&]*\s-u\s+\S+:[^\s]+'
 
 # ══ 生产环境专属：prod 下额外禁止（可选正则补充）═════════════
 # 说明：prod 只读的主判定在代码里实现（按「命令首词」精确匹配，避免

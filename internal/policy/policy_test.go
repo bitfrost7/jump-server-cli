@@ -173,6 +173,61 @@ func TestAllowNormalOps(t *testing.T) {
 	}
 }
 
+// ── 提示级：放行但必须标记 ───────────────────────────────────
+
+func TestWarnCases(t *testing.T) {
+	eng := newTestEngine(t)
+	cases := []struct{ name, cmd, wantRule string }{
+		{"内嵌大块 base64", `echo '` + longB64(300) + `' | base64 -d > /tmp/x`, "WARN-801-inline-base64"},
+		{"内联脚本", `python3 -c 'print(1)'`, "WARN-802-inline-script"},
+		{"网络下载", `curl -s http://x/metrics`, "WARN-803-network-fetch"},
+		{"git clone", `git clone git@x:y/z.git`, "WARN-804-git-clone"},
+		{"scp 传文件", `scp ./a.txt root@10.0.0.1:/tmp/`, "WARN-805-file-transfer-cmd"},
+		{"读历史", `history | tail -20`, "WARN-806-history-read"},
+		{"全盘 find", `find / -name '*.log'`, "WARN-807-recursive-find"},
+		{"明文口令 docker", `docker login -u iaas -p Secret123 hub.x.com`, "WARN-808-plaintext-credential"},
+		{"明文口令 redis", `redis-cli -a Secret123 GET foo`, "WARN-808-plaintext-credential"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			v := eng.Check("test", c.cmd)
+			if v.Blocked() {
+				t.Fatalf("提示级规则不应拒绝\n  命令: %s\n  命中: %s", c.cmd, v.RuleID)
+			}
+			if v.Decision != Warn {
+				t.Fatalf("应给出提示，实际 %s\n  命令: %s", v.Decision, c.cmd)
+			}
+			if v.RuleID != c.wantRule {
+				t.Errorf("命中规则不符：得到 %s，期望 %s", v.RuleID, c.wantRule)
+			}
+		})
+	}
+}
+
+// 明文凭据不得误报到普通 redis/mysql 只读用法上
+func TestNoPlaintextCredFalsePositive(t *testing.T) {
+	eng := newTestEngine(t)
+	for _, cmd := range []string{
+		`redis-cli -p 26379 sentinel master mymaster`,
+		`redis-cli -h 10.0.0.1 -p 6379 GET foo`,
+		`mysql -h db -u root -e "select 1"`,
+		`curl -s http://10.0.0.1:9190/metrics`,
+	} {
+		if v := eng.Check("test", cmd); v.RuleID == "WARN-808-plaintext-credential" {
+			t.Errorf("误报明文凭据\n  命令: %s", cmd)
+		}
+	}
+}
+
+func longB64(n int) string {
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = alphabet[i%len(alphabet)]
+	}
+	return string(b)
+}
+
 // ── 生产环境只读 ───────────────────────────────────────────────
 
 func TestProdReadOnly(t *testing.T) {
